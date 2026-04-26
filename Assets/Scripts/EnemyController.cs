@@ -1,20 +1,19 @@
-using UnityEngine;
+﻿using UnityEngine;
 
 [RequireComponent(typeof(Rigidbody2D))]
 public class EnemyController : MonoBehaviour
 {
     public enum EnemyState { Patrolling, Chasing, Returning }
 
-    [Header("Patrol")]
-    public Transform[] patrolPoints;
+    [Header("Patrol Zone")]
+    public BoxCollider2D patrolZone;
     public float patrolSpeed = 2f;
-    public float waypointReachThreshold = 0.2f;
 
     [Header("Chase")]
     public float chaseSpeed = 4f;
-    public float detectionRadius = 3f;
+    public float returnSnapDistance = 0.3f;
 
-    [Header("Directional Sprites (same sheet)")]
+    [Header("Directional Sprites")]
     public Sprite[] southFrames;
     public Sprite[] swFrames;
     public Sprite[] westFrames;
@@ -25,16 +24,19 @@ public class EnemyController : MonoBehaviour
     public float frameRate = 8f;
 
     private EnemyState currentState = EnemyState.Patrolling;
-    private int currentPatrolIndex = 0;
+
+    private Vector2[] corners;
+    private float[] segmentLengths;
+    private float totalPerimeter;
+    private float perimeterT;
+
     private Transform player;
     private Rigidbody2D rb;
     private SpriteRenderer sr;
 
     private Sprite[] currentFrames;
-    private int currentFrame = 0;
-    private float frameTimer = 0f;
-
-    private bool isChasing = false;
+    private int currentFrame;
+    private float frameTimer;
 
     void Awake()
     {
@@ -46,78 +48,143 @@ public class EnemyController : MonoBehaviour
     void Start()
     {
         GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
-        if (playerObj != null) player = playerObj.transform;
-        if (patrolPoints != null && patrolPoints.Length > 0)
-            transform.position = patrolPoints[0].position;
+        if (playerObj != null)
+            player = playerObj.transform;
+
+        BuildPerimeter();
+        perimeterT = GetClosestPerimeterT((Vector2)transform.position);
+    }
+
+    void BuildPerimeter()
+    {
+        if (patrolZone == null)
+        {
+            Debug.LogWarning("[EnemyController] No patrolZone assigned!", this);
+            return;
+        }
+
+        Bounds b = patrolZone.bounds;
+        corners = new Vector2[4]
+        {
+            new Vector2(b.min.x, b.min.y),
+            new Vector2(b.max.x, b.min.y),
+            new Vector2(b.max.x, b.max.y),
+            new Vector2(b.min.x, b.max.y)
+        };
+
+        segmentLengths = new float[4];
+        totalPerimeter = 0f;
+        for (int i = 0; i < 4; i++)
+        {
+            segmentLengths[i] = Vector2.Distance(corners[i], corners[(i + 1) % 4]);
+            totalPerimeter += segmentLengths[i];
+        }
+    }
+
+    float GetClosestPerimeterT(Vector2 pos)
+    {
+        float bestT = 0f;
+        float bestDist = float.MaxValue;
+        float accum = 0f;
+
+        for (int i = 0; i < 4; i++)
+        {
+            Vector2 a = corners[i];
+            Vector2 b = corners[(i + 1) % 4];
+            Vector2 ab = b - a;
+            float segLen = segmentLengths[i];
+            float t = Mathf.Clamp01(Vector2.Dot(pos - a, ab) / (segLen * segLen));
+            float dist = Vector2.Distance(pos, a + ab * t);
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestT = accum + t * segLen;
+            }
+
+            accum += segLen;
+        }
+
+        return bestT;
+    }
+
+    Vector2 GetPositionAtT(float t)
+    {
+        t = ((t % totalPerimeter) + totalPerimeter) % totalPerimeter;
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (t <= segmentLengths[i])
+                return Vector2.Lerp(corners[i], corners[(i + 1) % 4], t / segmentLengths[i]);
+            t -= segmentLengths[i];
+        }
+
+        return corners[0];
     }
 
     void Update()
     {
-        if (player == null) return;
+        if (player == null || corners == null) return;
         if (GameManager.Instance != null && GameManager.Instance.IsGameOver)
         {
             rb.linearVelocity = Vector2.zero;
             return;
         }
 
-        float dist = Vector2.Distance(transform.position, player.position);
+        bool playerInZone = patrolZone != null && patrolZone.OverlapPoint((Vector2)player.position);
 
         switch (currentState)
         {
             case EnemyState.Patrolling:
-                isChasing = false;
-                if (dist <= detectionRadius) currentState = EnemyState.Chasing;
-                else Patrol();
+                if (playerInZone)
+                    currentState = EnemyState.Chasing;
+                else
+                    PatrolPerimeter();
                 break;
 
             case EnemyState.Chasing:
-                isChasing = true;
-                if (dist > detectionRadius) currentState = EnemyState.Returning;
-                else Chase();
+                if (!playerInZone)
+                {
+                    perimeterT = GetClosestPerimeterT((Vector2)transform.position);
+                    currentState = EnemyState.Returning;
+                }
+                else
+                {
+                    MoveTowards(player.position, chaseSpeed);
+                }
                 break;
 
             case EnemyState.Returning:
-                isChasing = false;
-                if (dist <= detectionRadius) currentState = EnemyState.Chasing;
-                else ReturnToNearestPoint();
+                if (playerInZone)
+                {
+                    currentState = EnemyState.Chasing;
+                }
+                else
+                {
+                    Vector2 closestOnEdge = GetPositionAtT(perimeterT);
+                    MoveTowards(closestOnEdge, patrolSpeed);
+
+                    if (Vector2.Distance(transform.position, closestOnEdge) < returnSnapDistance)
+                        currentState = EnemyState.Patrolling;
+                }
                 break;
         }
 
-        sr.color = isChasing ? Color.red : Color.white;
-
+        sr.color = currentState == EnemyState.Chasing ? Color.red : Color.white;
         TickAnimation(rb.linearVelocity);
     }
 
-    void Patrol()
+    void PatrolPerimeter()
     {
-        if (patrolPoints == null || patrolPoints.Length == 0) return;
-        MoveTowards(patrolPoints[currentPatrolIndex].position, patrolSpeed);
-        if (Vector2.Distance(transform.position, patrolPoints[currentPatrolIndex].position) < waypointReachThreshold)
-            currentPatrolIndex = (currentPatrolIndex + 1) % patrolPoints.Length;
+        float lookahead = patrolSpeed * Time.deltaTime;
+        perimeterT = (perimeterT + lookahead) % totalPerimeter;
+        Vector2 target = GetPositionAtT(perimeterT);
+        MoveTowards(target, patrolSpeed);
     }
 
-    void Chase() => MoveTowards(player.position, chaseSpeed);
-
-    void ReturnToNearestPoint()
+    void MoveTowards(Vector2 target, float speed)
     {
-        int nearest = 0;
-        float minDist = float.MaxValue;
-        for (int i = 0; i < patrolPoints.Length; i++)
-        {
-            float d = Vector2.Distance(transform.position, patrolPoints[i].position);
-            if (d < minDist) { minDist = d; nearest = i; }
-        }
-        MoveTowards(patrolPoints[nearest].position, patrolSpeed);
-        if (Vector2.Distance(transform.position, patrolPoints[nearest].position) < waypointReachThreshold)
-        {
-            currentPatrolIndex = nearest;
-            currentState = EnemyState.Patrolling;
-        }
-    }
-
-    void MoveTowards(Vector3 target, float speed)
-    {
-        Vector2 dir = ((Vector2)target - (Vector2)transform.position).normalized;
+        Vector2 dir = (target - (Vector2)transform.position).normalized;
         rb.linearVelocity = dir * speed;
     }
 
@@ -153,22 +220,14 @@ public class EnemyController : MonoBehaviour
 
         sr.flipX = false;
 
-        if (angle >= 255f && angle < 285f)
-            currentFrames = southFrames;
-        else if (angle >= 285f && angle < 345f)
-        { currentFrames = swFrames; sr.flipX = true; }
-        else if (angle >= 345f || angle < 15f)
-        { currentFrames = westFrames; sr.flipX = true; }
-        else if (angle >= 15f && angle < 75f)
-        { currentFrames = nwFrames; sr.flipX = true; }
-        else if (angle >= 75f && angle < 105f)
-            currentFrames = northFrames;
-        else if (angle >= 105f && angle < 165f)
-            currentFrames = nwFrames;
-        else if (angle >= 165f && angle < 210f)
-            currentFrames = westFrames;
-        else if (angle >= 210f && angle < 255f)
-            currentFrames = swFrames;
+        if      (angle >= 255f && angle < 285f) currentFrames = southFrames;
+        else if (angle >= 285f && angle < 345f) { currentFrames = swFrames;   sr.flipX = true; }
+        else if (angle >= 345f || angle < 15f)  { currentFrames = westFrames; sr.flipX = true; }
+        else if (angle >= 15f  && angle < 75f)  { currentFrames = nwFrames;   sr.flipX = true; }
+        else if (angle >= 75f  && angle < 105f)   currentFrames = northFrames;
+        else if (angle >= 105f && angle < 165f)   currentFrames = nwFrames;
+        else if (angle >= 165f && angle < 210f)   currentFrames = westFrames;
+        else if (angle >= 210f && angle < 255f)   currentFrames = swFrames;
     }
 
     void OnTriggerEnter2D(Collider2D other)
@@ -185,7 +244,10 @@ public class EnemyController : MonoBehaviour
 
     void OnDrawGizmosSelected()
     {
-        Gizmos.color = new Color(1f, 0.3f, 0f, 0.4f);
-        Gizmos.DrawWireSphere(transform.position, detectionRadius);
+        if (patrolZone == null) return;
+        Gizmos.color = new Color(0f, 1f, 0.4f, 0.25f);
+        Gizmos.DrawCube(patrolZone.bounds.center, patrolZone.bounds.size);
+        Gizmos.color = new Color(0f, 1f, 0.4f, 0.9f);
+        Gizmos.DrawWireCube(patrolZone.bounds.center, patrolZone.bounds.size);
     }
 }
